@@ -5,6 +5,21 @@ import React, { useEffect, useMemo, useState } from "react";
 type FiatCurrency = "PLN" | "EUR" | "USD";
 type MoneyCurrency = FiatCurrency | "USDT";
 
+type Deal = {
+  id: string;
+  time: string; // HH:MM
+  clientName: string;
+  telegram: string;
+  comment: string;
+  amountIn: number;
+  amountInCurrency: MoneyCurrency;
+  amountOut: number;
+  amountOutCurrency: MoneyCurrency;
+  rate?: number;
+  fee: number;
+  feeCurrency: MoneyCurrency;
+  fromWallet: string;
+  toWallet: string;
   createdBy?: string;
 };
 
@@ -689,20 +704,6 @@ export default function Page() {
             >
               Войти
             </button>
-            {process.env.NODE_ENV !== "production" && (
-              <div className="mt-4 text-[10px] text-slate-500">
-                <p className="font-semibold mb-1">ТЕСТОВЫЕ ДАННЫЕ:</p>
-                <p>
-                  admin: <span className="text-emerald-300">dasha / dasha123</span>
-                </p>
-                <p>
-                  admin: <span className="text-emerald-300">pasha / pasha123</span>
-                </p>
-                <p>
-                  worker: <span className="text-emerald-300">worker / worker123</span>
-                </p>
-              </div>
-            )}
           </div>
         </div>
       </main>
