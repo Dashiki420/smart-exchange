@@ -21,6 +21,8 @@ type Deal = {
   fromWallet: string;
   toWallet: string;
   createdBy?: string;
+  internalNote?: string;
+  noteTags?: string[]; // tagi dla notek: "ważne", "do sprawdzenia" itd.
 };
 
 type Balances = {
@@ -81,11 +83,100 @@ function formatTime(date: Date) {
   return date.toTimeString().slice(0, 5);
 }
 
+function calcFeeInUsdt(amountIn: number, percent: number): number {
+  if (!amountIn || !percent) return 0;
+  return +(amountIn * (percent / 100)).toFixed(2);
+}
+
+function calculateCommission(
+  manualFeeString: string,
+  dealPercentString: string,
+  dailyPercentString: string,
+  amountIn: number,
+  amountInCurrency: MoneyCurrency,
+  amountOutCurrency: MoneyCurrency,
+  rateNum?: number,
+  apiRates?: ApiRates | null
+): number {
+  // 1) Jeśli użytkownik wpisał manualną kwotę prowizji — użyj jej (zakładamy, że jest w USDT)
+  const manualFee = parseFloat(manualFeeString.replace(",", "."));
+  if (!Number.isNaN(manualFee) && manualFeeString.trim() !== "") {
+    return +manualFee.toFixed(2);
+  }
+
+  // 2) Jeśli jest procent na transakcji — używamy go zamiast szablonów
+  const dealPercent = parseFloat(dealPercentString.replace(",", "."));
+  if (!Number.isNaN(dealPercent) && dealPercentString.trim() !== "") {
+    // zależnie od pary obliczamy w USDT
+    if (amountInCurrency === "USDT") {
+      return +(amountIn * (dealPercent / 100)).toFixed(2);
+    }
+    if (amountOutCurrency === "USDT") {
+      // need rate to convert fiat -> USDT: grossUsdt = amountIn / rateNum
+      if (!rateNum || rateNum === 0) return 0;
+      const grossUsdt = amountIn / rateNum;
+      return +(grossUsdt * (dealPercent / 100)).toFixed(2);
+    }
+    // fiat -> fiat: percent applies to amountOut (amountIn * rateNum)
+    if (rateNum && rateNum !== 0) {
+      const amountOut = amountIn * rateNum;
+      const feeOut = amountOut * (dealPercent / 100);
+      // convert fiat fee to USDT using apiRates (1 USDT = apiRates[fiat])
+      const outFiat = amountOutCurrency as FiatCurrency;
+      const fiatToUsdtRate = apiRates?.[outFiat];
+      if (fiatToUsdtRate && fiatToUsdtRate !== 0) {
+        return +(feeOut / fiatToUsdtRate).toFixed(2);
+      }
+    }
+    return 0;
+  }
+
+  // 3) Brak manualnej prowizji i brak procentu — stosujemy szablony
+  const dailyPercent = parseFloat(dailyPercentString.replace(",", "."));
+
+  // A) USDT -> FIAT: szablony oparte na kwocie w USDT
+  if (amountInCurrency === "USDT" && amountOutCurrency !== "USDT") {
+    if (amountIn <= 1499) return 15;
+    if (amountIn > 5000) return +(amountIn * -0.01).toFixed(2);
+    return 0;
+  }
+
+  // B) FIAT -> USDT: liczymy najpierw gross w USDT
+  if (amountInCurrency !== "USDT" && amountOutCurrency === "USDT") {
+    if (!rateNum || rateNum === 0) return 0;
+    const grossUsdt = amountIn / rateNum;
+    if (grossUsdt <= 1000) return 20;
+    return +(grossUsdt * 0.02).toFixed(2);
+  }
+
+  // C) FIAT -> FIAT: bez procentu = 0
+  return 0;
+}
+
+function calculateAutoCommissionUsdt(
+  amountInUsdt: number,
+  defaultPercent: number,
+  customPercent: number | null
+): number {
+  if (!amountInUsdt || amountInUsdt <= 0) return 0;
+
+  const percent = customPercent ?? defaultPercent;
+
+  // До 1000 USDT — фиксированная комиссия 20 USDT
+  if (amountInUsdt < 1000) {
+    return 20;
+  }
+
+  // От 1000 и выше — процент от суммы (может быть отрицательным)
+  return +(amountInUsdt * percent / 100);
+}
+
 const STORAGE_BALANCES_KEY = "smart-exchange-balances-v1";
 const STORAGE_DEALS_KEY = "smart-exchange-deals-v1";
 const STORAGE_USER_KEY = "smart-exchange-current-user-v1";
 
 type DealsByDate = Record<string, Deal[]>;
+type DayNotes = Record<string, string>;
 
 type ApiRates = {
   PLN: number;
@@ -122,16 +213,52 @@ export default function Page() {
   const [useApiForFiat, setUseApiForFiat] = useState<boolean>(true);
 
   // --- Balans dnia + transakcje ---
-  const [selectedDate] = useState<string>(TODAY_KEY());
+  const [selectedDate, setSelectedDate] = useState<string>(TODAY_KEY());
   const [startBalances, setStartBalances] = useState<Balances>(emptyBalances);
   const [dealsByDate, setDealsByDate] = useState<DealsByDate>({});
+  const [selectedDealIds, setSelectedDealIds] = useState<string[]>([]);
   const currentDeals = dealsByDate[selectedDate] || [];
+  const allDates = useMemo(() => Object.keys(dealsByDate).sort().reverse(), [dealsByDate]);
+
+  // Zbierz unikalne klientów i Telegram z historii dla podpowiedzi
+  const uniqueClients = useMemo(() => {
+    const clients = new Set<string>();
+    Object.values(dealsByDate).forEach((deals) => {
+      deals.forEach((d) => {
+        if (d.clientName) clients.add(d.clientName);
+      });
+    });
+    return Array.from(clients).sort();
+  }, [dealsByDate]);
+
+  const uniqueTelegramAccounts = useMemo(() => {
+    const accounts = new Set<string>();
+    Object.values(dealsByDate).forEach((deals) => {
+      deals.forEach((d) => {
+        if (d.telegram) accounts.add(d.telegram);
+      });
+    });
+    return Array.from(accounts).sort();
+  }, [dealsByDate]);
 
   // --- API kursów ---
   const [apiRates, setApiRates] = useState<ApiRates | null>(null);
   const [apiStatus, setApiStatus] = useState<ApiStatus>("idle");
   const [lastApiUpdate, setLastApiUpdate] = useState<string | null>(null);
 
+  // --- Dzienna domyślna prowizja ---
+  const [dailyFeePercent, setDailyFeePercent] = useState<string>("1.0");
+
+  // Komisja i tryb manualny
+  const [commission, setCommission] = useState<string>("0.00");
+  const [isCommissionManual, setIsCommissionManual] = useState<boolean>(false);
+  const [clientGets, setClientGets] = useState<string>("0.00");
+  
+  // Notatki na dzień
+  const [dayNotes, setDayNotes] = useState<DayNotes>({});
+  const currentNote = dayNotes[selectedDate] || "";
+  // Internal note for new deal
+  const [newDealInternalNote, setNewDealInternalNote] = useState<string>("");
   // formularz nowej transakcji
   const [newDeal, setNewDeal] = useState({
     clientName: "",
@@ -171,6 +298,95 @@ export default function Page() {
       window.localStorage.removeItem(STORAGE_USER_KEY);
     }
   }, [currentUser]);
+
+  // ---- DZIENNA PROWIZJA: wczytaj z localStorage ----
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const todayKey = TODAY_KEY();
+    const storageKey = `daily-commission-${todayKey}`;
+    try {
+      const stored = window.localStorage.getItem(storageKey);
+      if (stored) {
+        setDailyFeePercent(stored);
+      }
+    } catch (e) {
+      console.error("Cannot read daily commission from localStorage", e);
+    }
+
+    // Wczytaj ostatnio wybraną datę z localStorage
+    try {
+      const lastDate = window.localStorage.getItem("smart-exchange-last-selected-date");
+      if (lastDate) {
+        setSelectedDate(lastDate);
+      }
+    } catch (e) {
+      console.error("Cannot read last selected date from localStorage", e);
+    }
+  }, []);
+
+  // ---- Wczytaj dealsByDate z localStorage przy mountcie ----
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem("smartExchangeDealsByDate");
+      if (raw) {
+        const parsed = JSON.parse(raw) as DealsByDate;
+        if (parsed && typeof parsed === "object") {
+          setDealsByDate(parsed);
+        }
+      }
+      // load day notes if present
+      const rawNotes = window.localStorage.getItem("smart-exchange-day-notes");
+      if (rawNotes) {
+        try {
+          const notesParsed = JSON.parse(rawNotes) as DayNotes;
+          if (notesParsed && typeof notesParsed === "object") {
+            setDayNotes(notesParsed);
+          }
+        } catch (e) {
+          console.error("Cannot parse day notes from localStorage", e);
+        }
+      }
+    } catch (e) {
+      console.error("Cannot read dealsByDate from localStorage", e);
+    }
+  }, []);
+
+  // ---- Zapisuj dealsByDate do localStorage przy każdej zmianie ----
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        "smartExchangeDealsByDate",
+        JSON.stringify(dealsByDate)
+      );
+    } catch (e) {
+      console.error("Cannot save dealsByDate to localStorage", e);
+    }
+  }, [dealsByDate]);
+
+  // Save day notes to localStorage on change
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        "smart-exchange-day-notes",
+        JSON.stringify(dayNotes)
+      );
+    } catch (e) {
+      console.error("Cannot save day notes to localStorage", e);
+    }
+  }, [dayNotes]);
+
+  // Zapamiętaj ostatnio wybraną datę w localStorage
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem("smart-exchange-last-selected-date", selectedDate);
+    } catch (e) {
+      console.error("Cannot save last selected date to localStorage", e);
+    }
+  }, [selectedDate]);
 
   const handleLogin = () => {
     const username = loginForm.username.trim().toLowerCase();
@@ -366,114 +582,65 @@ export default function Page() {
     return { gross: grossUsdt, fee: feeUsdt, client: clientUsdt };
   }, [fiatAmount, fiatEffectiveRate]);
 
-  // === AUTO-OBLICZANIE DLA FORMULARZA "НОВАЯ СДЕЛКА" (USDT i FIAT↔FIAT) ===
+  // === AUTO-OBLICZANIE DLA FORMULARZA "НОВАЯ СДЕЛКА" ===
   useEffect(() => {
-    const amountInNum = parseFloat(newDeal.amountIn.replace(",", "."));
-    const rateNum = parseFloat(newDeal.rate.replace(",", "."));
-    const percentNum = parseFloat(newDeal.customPercent.replace(",", "."));
+    const amount = parseFloat(newDeal.amountIn.replace(",", ".")) || 0;
+    const rate = parseFloat(newDeal.rate.replace(",", ".")) || 0;
 
-    if (!amountInNum || !rateNum) return;
+    const defaultPercent =
+      parseFloat(dailyFeePercent.replace(",", ".")) || 0;
+    const customPercent =
+      newDeal.customPercent && newDeal.customPercent.trim() !== ""
+        ? parseFloat(newDeal.customPercent.replace(",", "."))
+        : null;
 
-    const { amountInCurrency, amountOutCurrency } = newDeal;
-
-    let autoAmountOut = "";
-    let autoFee = "";
-    let autoFeeCurrency: MoneyCurrency = newDeal.feeCurrency;
-
-    const hasCustomPercent =
-      !Number.isNaN(percentNum) && newDeal.customPercent.trim() !== "";
-
-    // (A) USDT → FIAT
-    if (amountInCurrency === "USDT" && amountOutCurrency !== "USDT") {
-      const grossFiat = amountInNum * rateNum;
-      let clientFiat: number;
-      let feeFiat: number;
-
-      if (hasCustomPercent) {
-        feeFiat = (grossFiat * percentNum) / 100;
-        clientFiat = grossFiat - feeFiat;
-      } else {
-        // Szablony dla USDT → FIAT
-        if (amountInNum <= 1499) {
-          feeFiat = 15 * rateNum;
-          clientFiat = grossFiat - feeFiat;
-        } else if (amountInNum > 5000) {
-          clientFiat = grossFiat * 1.01;
-          feeFiat = grossFiat * -0.01;
-        } else {
-          // 1500-5000: domyślnie brak komisji
-          feeFiat = 0;
-          clientFiat = grossFiat;
-        }
-      }
-
-      autoAmountOut = clientFiat.toFixed(2);
-      autoFee = feeFiat.toFixed(2);
-      autoFeeCurrency = amountOutCurrency;
-    }
-    // (B) FIAT → USDT
-    else if (amountInCurrency !== "USDT" && amountOutCurrency === "USDT") {
-      const grossUsdt = amountInNum / rateNum;
-      let clientUsdt: number;
-      let feeUsdt: number;
-
-      if (hasCustomPercent) {
-        feeUsdt = (grossUsdt * percentNum) / 100;
-        clientUsdt = grossUsdt - feeUsdt;
-      } else {
-        // Szablony dla FIAT → USDT
-        if (grossUsdt <= 1000) {
-          feeUsdt = 20;
-        } else {
-          feeUsdt = grossUsdt * 0.02;
-        }
-        clientUsdt = grossUsdt - feeUsdt;
-      }
-
-      autoAmountOut = clientUsdt.toFixed(2);
-      autoFee = feeUsdt.toFixed(2);
-      autoFeeCurrency = "USDT";
-    }
-    // (C) DOWOLNA INNA PARA (np. EUR → PLN, PLN → USD, USD → EUR itd.)
-    else {
-      const grossOut = amountInNum * rateNum;
-      let clientOut: number;
-      let feeOut: number;
-
-      if (hasCustomPercent) {
-        feeOut = (grossOut * percentNum) / 100;
-        clientOut = grossOut - feeOut;
-      } else {
-        feeOut = 0;
-        clientOut = grossOut;
-      }
-
-      autoAmountOut = clientOut.toFixed(2);
-      autoFee = feeOut.toFixed(2);
-      autoFeeCurrency = amountOutCurrency;
+    // amountIn expressed in USDT for commission logic
+    let amountInUsdt = amount;
+    if (newDeal.amountInCurrency !== "USDT") {
+      amountInUsdt = rate ? amount / rate : 0;
     }
 
-    if (autoAmountOut === "" && autoFee === "") return;
+    let commissionUsdt = parseFloat(commission.replace(",", ".")) || 0;
+
+    // jeśli nie w trybie manualnym — przeliczamy automatycznie
+    if (!isCommissionManual) {
+      commissionUsdt = calculateAutoCommissionUsdt(
+        amountInUsdt,
+        defaultPercent,
+        customPercent
+      );
+      setCommission(commissionUsdt ? commissionUsdt.toFixed(2) : "0.00");
+    }
+
+    // Oblicz ile klient otrzymuje (w walucie out)
+    let clientGetsNum = 0;
+    if (newDeal.amountOutCurrency === "USDT") {
+      clientGetsNum = amountInUsdt - commissionUsdt;
+    } else {
+      clientGetsNum = (amountInUsdt - commissionUsdt) * rate;
+    }
+
+    setClientGets(Number.isFinite(clientGetsNum) ? clientGetsNum.toFixed(2) : "0.00");
+
+    // Zaktualizuj pola formularza (amountOut i fee) — fee zawsze w USDT
+    const feeStr = commissionUsdt ? commissionUsdt.toFixed(2) : "0.00";
+    const amountOutStr = Number.isFinite(clientGetsNum) ? clientGetsNum.toFixed(2) : "0.00";
 
     setNewDeal((prev) => {
-      const sameOut =
-        prev.amountOut.replace(",", ".") === autoAmountOut.toString();
-      const sameFee = prev.fee.replace(",", ".") === autoFee.toString();
-      if (sameOut && sameFee && prev.feeCurrency === autoFeeCurrency) return prev;
-
+      if (prev.fee === feeStr && prev.amountOut === amountOutStr) return prev;
       return {
         ...prev,
-        amountOut: autoAmountOut,
-        fee: autoFee,
-        feeCurrency: autoFeeCurrency,
+        amountOut: amountOutStr,
+        fee: feeStr,
+        feeCurrency: "USDT",
       };
     });
   }, [
     newDeal.amountIn,
     newDeal.rate,
-    newDeal.amountInCurrency,
-    newDeal.amountOutCurrency,
+    dailyFeePercent,
     newDeal.customPercent,
+    isCommissionManual,
   ]);
 
   // === Dodawanie transakcji ===
@@ -485,7 +652,6 @@ export default function Page() {
 
     const amountInNum = parseFloat(newDeal.amountIn.replace(",", "."));
     const amountOutNum = parseFloat(newDeal.amountOut.replace(",", "."));
-    const feeNum = parseFloat(newDeal.fee.replace(",", ".") || "0");
     const rateNum = newDeal.rate
       ? parseFloat(newDeal.rate.replace(",", "."))
       : undefined;
@@ -494,6 +660,9 @@ export default function Page() {
       alert("Wpisz poprawnie kwoty wejściową i wyjściową.");
       return;
     }
+
+    // Final fee determined by commission state (manual or auto-calculated)
+    const finalFee = parseFloat(commission.replace(",", ".")) || 0;
 
     const now = new Date();
     const deal: Deal = {
@@ -507,11 +676,12 @@ export default function Page() {
       amountOut: amountOutNum,
       amountOutCurrency: newDeal.amountOutCurrency,
       rate: rateNum,
-      fee: isNaN(feeNum) ? 0 : feeNum,
-      feeCurrency: newDeal.feeCurrency,
+      fee: finalFee,
+      feeCurrency: "USDT",
       fromWallet: newDeal.fromWallet.trim(),
       toWallet: newDeal.toWallet.trim(),
       createdBy: currentUser.displayName,
+      internalNote: newDealInternalNote.trim() || undefined,
     };
 
     setDealsByDate((prev) => {
@@ -535,6 +705,7 @@ export default function Page() {
       fromWallet: "",
       toWallet: "",
     }));
+    setNewDealInternalNote("");
   };
 
   const handleDeleteDeal = (id: string) => {
@@ -545,6 +716,97 @@ export default function Page() {
         [selectedDate]: dayDeals.filter((d) => d.id !== id),
       };
     });
+  };
+
+  // Toggle selection for multi-delete
+  const toggleDealSelection = (id: string) => {
+    setSelectedDealIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  };
+
+  const handleDeleteSelectedDeals = () => {
+    if (selectedDealIds.length === 0) return;
+    setDealsByDate((prev) => {
+      const dayDeals = prev[selectedDate] || [];
+      const filtered = dayDeals.filter((d) => !selectedDealIds.includes(d.id));
+      return {
+        ...prev,
+        [selectedDate]: filtered,
+      };
+    });
+    setSelectedDealIds([]);
+  };
+
+  const handleDeleteAllDealsForDay = () => {
+    if (!confirm("Удалить все сделки за этот день?")) return;
+    setDealsByDate((prev) => ({ ...prev, [selectedDate]: [] }));
+    setSelectedDealIds([]);
+  };
+
+  // Editing internal note for a single deal
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
+  const [editingNoteValue, setEditingNoteValue] = useState<string>("");
+  const [editingNoteTags, setEditingNoteTags] = useState<string[]>([]);
+  const [customTagInput, setCustomTagInput] = useState<string>("");
+
+  const AVAILABLE_TAGS = ["важное", "проверить", "задержка", "проблема"];
+  const TAG_COLORS: Record<string, string> = {
+    "важное": "bg-red-500/20 border-red-500/50 text-red-300",
+    "проверить": "bg-yellow-500/20 border-yellow-500/50 text-yellow-300",
+    "задержка": "bg-orange-500/20 border-orange-500/50 text-orange-300",
+    "проблема": "bg-purple-500/20 border-purple-500/50 text-purple-300",
+  };
+
+  const startEditNote = (dealId: string, current?: string, currentTags?: string[]) => {
+    setEditingNoteId(dealId);
+    setEditingNoteValue(current || "");
+    setEditingNoteTags(currentTags || []);
+    setCustomTagInput("");
+  };
+
+  const cancelEditNote = () => {
+    setEditingNoteId(null);
+    setEditingNoteValue("");
+    setEditingNoteTags([]);
+    setCustomTagInput("");
+  };
+
+  const toggleTag = (tag: string) => {
+    setEditingNoteTags((prev) =>
+      prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
+    );
+  };
+
+  const addCustomTag = () => {
+    const trimmed = customTagInput.trim().toLowerCase();
+    if (trimmed && !editingNoteTags.includes(trimmed)) {
+      setEditingNoteTags((prev) => [...prev, trimmed]);
+      setCustomTagInput("");
+    }
+  };
+
+  const removeTag = (tag: string) => {
+    setEditingNoteTags((prev) => prev.filter((t) => t !== tag));
+  };
+
+  const applyNoteTemplate = (template: string) => {
+    setEditingNoteValue((prev) => (prev ? prev + "\n" + template : template));
+  };
+
+  const saveEditNote = () => {
+    if (!editingNoteId) return;
+    const newVal = editingNoteValue.trim();
+    setDealsByDate((prev) => {
+      const dayDeals = prev[selectedDate] || [];
+      const updated = dayDeals.map((d) =>
+        d.id === editingNoteId
+          ? { ...d, internalNote: newVal || undefined, noteTags: editingNoteTags.length > 0 ? editingNoteTags : undefined }
+          : d
+      );
+      return { ...prev, [selectedDate]: updated };
+    });
+    cancelEditNote();
   };
 
   // === Podsumowanie dnia ===
@@ -606,6 +868,8 @@ export default function Page() {
       "FromWallet",
       "ToWallet",
       "Comment",
+      "InternalNote",
+      "NoteTags",
       "CreatedBy",
     ];
 
@@ -630,6 +894,8 @@ export default function Page() {
         safe(deal.fromWallet),
         safe(deal.toWallet),
         safe(deal.comment),
+        safe(deal.internalNote || ""),
+        safe(deal.noteTags ? deal.noteTags.join(", ") : ""),
         safe(deal.createdBy || ""),
       ]
         .map((v) => `"${v}"`)
@@ -1063,8 +1329,35 @@ export default function Page() {
           </section>
         )}
 
+        {/* --- USTAWIENIA DNIA --- */}
+        <section className="mb-10 rounded-3xl border border-slate-800 bg-slate-950/60 px-6 py-5 text-xs">
+          <h2 className="mb-3 text-sm font-semibold">Настройки дня</h2>
+          <p className="mb-4 text-slate-300">Процент комиссии на сегодня по умолчанию</p>
+          <div className="flex gap-2 items-end max-w-sm">
+            <div className="flex-1">
+              <input
+                type="number"
+                className="w-full rounded-xl bg-black px-3 py-2 text-sm border border-slate-700 outline-none focus:border-emerald-400"
+                placeholder="1.0"
+                value={dailyFeePercent}
+                onChange={(e) => {
+                  setDailyFeePercent(e.target.value);
+                  const todayKey = TODAY_KEY();
+                  const storageKey = `daily-commission-${todayKey}`;
+                  if (e.target.value.trim()) {
+                    window.localStorage.setItem(storageKey, e.target.value);
+                  } else {
+                    window.localStorage.removeItem(storageKey);
+                  }
+                }}
+              />
+            </div>
+            <p className="text-slate-300">%</p>
+          </div>
+        </section>
+
         {/* --- NOWA TRANSAKCJA --- */}
-        <section className="mb-10 rounded-3xl border border-slate-800 bg-slate-950/80 px-6 py-6 text-xs">
+        <section className="mb-10 rounded-3xl border border-slate-800 bg-slate-950/60 px-6 py-5 text-xs">
           <h2 className="mb-4 text-sm font-semibold">
             Новая сделка (оператор: {currentUser.displayName})
           </h2>
@@ -1072,24 +1365,72 @@ export default function Page() {
           <div className="grid gap-4 md:grid-cols-3">
             <div className="space-y-2">
               <p className="text-slate-300">Имя клиента</p>
-              <input
-                className="w-full rounded-xl bg-black px-3 py-2 text-sm border border-slate-700"
-                value={newDeal.clientName}
-                onChange={(e) =>
-                  setNewDeal((p) => ({ ...p, clientName: e.target.value }))
-                }
-              />
+              <div className="relative">
+                <input
+                  className="w-full rounded-xl bg-black px-3 py-2 text-sm border border-slate-700"
+                  value={newDeal.clientName}
+                  onChange={(e) =>
+                    setNewDeal((p) => ({ ...p, clientName: e.target.value }))
+                  }
+                  placeholder="Введите имя или выберите из списка"
+                />
+                {newDeal.clientName && (
+                  <div className="absolute top-full left-0 right-0 mt-1 bg-slate-900 border border-slate-700 rounded-xl z-10 max-h-32 overflow-y-auto">
+                    {uniqueClients
+                      .filter((c) =>
+                        c.toLowerCase().includes(newDeal.clientName.toLowerCase())
+                      )
+                      .slice(0, 5)
+                      .map((c) => (
+                        <button
+                          key={c}
+                          type="button"
+                          onClick={() =>
+                            setNewDeal((p) => ({ ...p, clientName: c }))
+                          }
+                          className="block w-full px-3 py-2 text-left text-sm text-slate-300 hover:bg-slate-800"
+                        >
+                          {c}
+                        </button>
+                      ))}
+                  </div>
+                )}
+              </div>
 
               <p className="mt-3 text-slate-300">
                 Username в Telegram (например, @cryptoMax)
               </p>
-              <input
-                className="w-full rounded-xl bg-black px-3 py-2 text-sm border border-slate-700"
-                value={newDeal.telegram}
-                onChange={(e) =>
-                  setNewDeal((p) => ({ ...p, telegram: e.target.value }))
-                }
-              />
+              <div className="relative">
+                <input
+                  className="w-full rounded-xl bg-black px-3 py-2 text-sm border border-slate-700"
+                  value={newDeal.telegram}
+                  onChange={(e) =>
+                    setNewDeal((p) => ({ ...p, telegram: e.target.value }))
+                  }
+                  placeholder="Введите или выберите"
+                />
+                {newDeal.telegram && (
+                  <div className="absolute top-full left-0 right-0 mt-1 bg-slate-900 border border-slate-700 rounded-xl z-10 max-h-32 overflow-y-auto">
+                    {uniqueTelegramAccounts
+                      .filter((t) =>
+                        t.toLowerCase().includes(newDeal.telegram.toLowerCase())
+                      )
+                      .slice(0, 5)
+                      .map((t) => (
+                        <button
+                          key={t}
+                          type="button"
+                          onClick={() =>
+                            setNewDeal((p) => ({ ...p, telegram: t }))
+                          }
+                          className="block w-full px-3 py-2 text-left text-sm text-slate-300 hover:bg-slate-800"
+                        >
+                          {t}
+                        </button>
+                      ))}
+                  </div>
+                )}
+              </div>
 
               <p className="mt-3 text-slate-300">
                 Хэш / комментарий (из какого кошелька → на какой)
@@ -1101,6 +1442,14 @@ export default function Page() {
                 onChange={(e) =>
                   setNewDeal((p) => ({ ...p, comment: e.target.value }))
                 }
+              />
+              <p className="mt-3 text-slate-300">Внутренняя заметка (для себя)</p>
+              <textarea
+                rows={3}
+                className="w-full rounded-xl bg-black px-3 py-2 text-sm border border-slate-700 resize-none"
+                placeholder="Короткая заметка оператора..."
+                value={newDealInternalNote}
+                onChange={(e) => setNewDealInternalNote(e.target.value)}
               />
             </div>
 
@@ -1216,24 +1565,20 @@ export default function Page() {
               <div className="flex gap-2">
                 <input
                   className="w-full rounded-xl bg-black px-3 py-2 text-sm border border-slate-700"
-                  value={newDeal.fee}
-                  onChange={(e) =>
-                    setNewDeal((p) => ({ ...p, fee: e.target.value }))
-                  }
+                  value={commission}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setCommission(value);
+                    setIsCommissionManual(value !== "");
+                    // If user cleared the commission, revert to auto mode
+                    if (value === "") setIsCommissionManual(false);
+                  }}
                 />
                 <select
-                  className="w-24 rounded-xl bg-black px-2 py-2 text-sm border border-slate-700"
-                  value={newDeal.feeCurrency}
-                  onChange={(e) =>
-                    setNewDeal((p) => ({
-                      ...p,
-                      feeCurrency: e.target.value as MoneyCurrency,
-                    }))
-                  }
+                  className="w-24 rounded-xl bg-black px-2 py-2 text-sm border border-slate-700 opacity-70 cursor-not-allowed"
+                  value="USDT"
+                  disabled
                 >
-                  <option value="PLN">PLN</option>
-                  <option value="EUR">EUR</option>
-                  <option value="USD">USD</option>
                   <option value="USDT">USDT</option>
                 </select>
               </div>
@@ -1272,6 +1617,77 @@ export default function Page() {
 
         {/* --- LISTA TRANSAKCJI --- */}
         <section className="mb-8 rounded-3xl border border-slate-800 bg-slate-950/80 px-6 py-5 text-xs">
+          <div className="mb-3 flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <input
+                  type="date"
+                  className="rounded-xl bg-black px-3 py-2 text-sm border border-slate-700"
+                  value={selectedDate}
+                  onChange={(e) => {
+                    setSelectedDate(e.target.value);
+                    setSelectedDealIds([]);
+                  }}
+                />
+                <button
+                  onClick={() => {
+                    const t = TODAY_KEY();
+                    setSelectedDate(t);
+                    setSelectedDealIds([]);
+                  }}
+                  className="rounded-full border border-slate-700 px-3 py-1 text-[11px] text-slate-200 hover:bg-slate-800"
+                >
+                  Сегодня
+                </button>
+              </div>
+              <div />
+            </div>
+
+            {/* Mini calendar / date pills based on dealsByDate */}
+            <div className="flex gap-2 overflow-x-auto pb-1">
+              {allDates.length === 0 ? (
+                <div className="text-slate-500 text-[11px]">Нет дат с сделками</div>
+              ) : (
+                allDates.map((dateKey) => {
+                  const count = dealsByDate[dateKey]?.length ?? 0;
+                  const isSelected = dateKey === selectedDate;
+                  return (
+                    <button
+                      key={dateKey}
+                      onClick={() => {
+                        setSelectedDate(dateKey);
+                        setSelectedDealIds([]);
+                      }}
+                      className={`flex items-center gap-2 whitespace-nowrap rounded-full px-3 py-1 text-xs transition ${
+                        isSelected
+                          ? "bg-emerald-500 text-black border border-emerald-400"
+                          : "bg-slate-800 text-slate-300 border border-slate-700"
+                      }`}
+                    >
+                      <span>{dateKey}{count > 0 ? ` (${count})` : ""}</span>
+                      {count > 0 && (
+                        <span className="h-2 w-2 rounded-full bg-emerald-400 inline-block" />
+                      )}
+                    </button>
+                  );
+                })
+              )}
+            </div>
+
+            <div>
+              <p className="text-slate-400 text-[11px] mb-1">Заметка на день</p>
+              <textarea
+                rows={3}
+                className="w-full rounded-xl bg-black px-3 py-2 text-sm border border-slate-700 resize-none"
+                placeholder="Короткая заметка для этой даты..."
+                value={currentNote}
+                onChange={(e) =>
+                  setDayNotes((p) => ({ ...p, [selectedDate]: e.target.value }))
+                }
+              />
+            </div>
+          </div>
+
           <div className="mb-3 flex items-center justify-between gap-2">
             <div className="flex items-center gap-3">
               <h2 className="text-sm font-semibold">
@@ -1289,6 +1705,21 @@ export default function Page() {
             </button>
           </div>
 
+          <div className="mb-3 flex items-center gap-2">
+            <button
+              onClick={handleDeleteSelectedDeals}
+              className="rounded-full border border-red-500/60 px-3 py-1 text-[11px] font-medium text-red-300 hover:bg-red-500/10"
+            >
+              Удалить выбранные сделки
+            </button>
+            <button
+              onClick={handleDeleteAllDealsForDay}
+              className="rounded-full border border-red-600/60 px-3 py-1 text-[11px] font-medium text-red-300 hover:bg-red-600/10"
+            >
+              Удалить все сделки за день
+            </button>
+          </div>
+
           {currentDeals.length === 0 ? (
             <p className="text-slate-500">На эту дату ещё нет сделок.</p>
           ) : (
@@ -1299,6 +1730,12 @@ export default function Page() {
                   className="rounded-2xl border border-slate-800 bg-slate-900/80 px-4 py-3"
                 >
                   <div className="flex items-center justify-between gap-2">
+                    <input
+                      type="checkbox"
+                      checked={selectedDealIds.includes(deal.id)}
+                      onChange={() => toggleDealSelection(deal.id)}
+                      className="h-4 w-4"
+                    />
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[11px] text-slate-300">
                         {deal.time}
@@ -1341,7 +1778,7 @@ export default function Page() {
                   <div className="mt-1 text-[11px] text-slate-300">
                     Комиссия:{" "}
                     <span className="text-amber-300">
-                      {formatMoney(deal.fee, deal.feeCurrency)}
+                        {formatMoney(deal.fee, "USDT")}
                     </span>
                   </div>
 
@@ -1357,6 +1794,140 @@ export default function Page() {
                   {deal.comment && (
                     <div className="mt-1 text-[11px] text-slate-400">
                       Примечание: {deal.comment}
+                    </div>
+                  )}
+
+                  {/* internal note display / edit */}
+                  {editingNoteId === deal.id ? (
+                    <div className="mt-3 border-t border-slate-800 pt-3">
+                      <p className="text-[11px] text-slate-400 mb-2">Шаблоны заметок:</p>
+                      <div className="flex flex-wrap gap-2 mb-3">
+                        {["Задержка", "Проблема с курсом", "Ожидание подтверждения"].map((template) => (
+                          <button
+                            key={template}
+                            type="button"
+                            onClick={() => applyNoteTemplate(template)}
+                            className="rounded-full border border-slate-700 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-800"
+                          >
+                            + {template}
+                          </button>
+                        ))}
+                      </div>
+
+                      <textarea
+                        rows={3}
+                        className="w-full rounded-xl bg-black px-3 py-2 text-sm border border-slate-700 resize-none mb-2"
+                        value={editingNoteValue}
+                        onChange={(e) => setEditingNoteValue(e.target.value)}
+                      />
+
+                      <p className="text-[11px] text-slate-400 mb-2">Теги:</p>
+                      <div className="flex flex-wrap gap-2 mb-3">
+                        {AVAILABLE_TAGS.map((tag) => (
+                          <button
+                            key={tag}
+                            type="button"
+                            onClick={() => toggleTag(tag)}
+                            className={`rounded-full border px-3 py-1 text-[11px] transition ${
+                              editingNoteTags.includes(tag)
+                                ? TAG_COLORS[tag]
+                                : "border-slate-700 text-slate-400 hover:border-slate-600"
+                            }`}
+                          >
+                            {editingNoteTags.includes(tag) ? "✓ " : ""}{tag}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Выбранные теги и возможность удаления */}
+                      {editingNoteTags.length > 0 && (
+                        <div className="mb-3 p-2 bg-slate-800/30 rounded-lg">
+                          <p className="text-[10px] text-slate-400 mb-1">Выбранные теги:</p>
+                          <div className="flex flex-wrap gap-1">
+                            {editingNoteTags.map((tag) => (
+                              <div
+                                key={tag}
+                                className={`rounded-full border px-2 py-0.5 text-[10px] flex items-center gap-1 ${
+                                  TAG_COLORS[tag] || "bg-slate-700/50 border-slate-600 text-slate-300"
+                                }`}
+                              >
+                                {tag}
+                                <button
+                                  type="button"
+                                  onClick={() => removeTag(tag)}
+                                  className="ml-1 font-bold hover:opacity-70"
+                                >
+                                  ×
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Добавить свой тег */}
+                      <div className="mb-3">
+                        <p className="text-[11px] text-slate-400 mb-1">Добавить свой тег:</p>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            className="flex-1 rounded-lg bg-black px-2 py-1 text-sm border border-slate-700"
+                            placeholder="Введите новый тег"
+                            value={customTagInput}
+                            onChange={(e) => setCustomTagInput(e.target.value)}
+                            onKeyPress={(e) => {
+                              if (e.key === "Enter") {
+                                addCustomTag();
+                              }
+                            }}
+                          />
+                          <button
+                            type="button"
+                            onClick={addCustomTag}
+                            className="rounded-lg border border-emerald-500/50 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10"
+                          >
+                            Добавить
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="flex gap-2">
+                        <button
+                          onClick={saveEditNote}
+                          className="rounded-full bg-emerald-500 px-3 py-1 text-[12px] text-black"
+                        >
+                          Сохранить заметку
+                        </button>
+                        <button
+                          onClick={cancelEditNote}
+                          className="rounded-full border border-slate-700 px-3 py-1 text-[12px] text-slate-300"
+                        >
+                          Отмена
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-2 border-t border-slate-800 pt-2">
+                      {deal.internalNote ? (
+                        <div className="text-[11px] text-slate-400 mb-2">Заметка: {deal.internalNote}</div>
+                      ) : (
+                        <div className="text-[11px] text-slate-500 mb-2">Нет заметки</div>
+                      )}
+                      {deal.noteTags && deal.noteTags.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mb-2">
+                          {deal.noteTags.map((tag) => (
+                            <span key={tag} className={`rounded-full border px-2 py-0.5 text-[10px] ${TAG_COLORS[tag]}`}>
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <button
+                        onClick={() => startEditNote(deal.id, deal.internalNote, deal.noteTags)}
+                        className="rounded-full border border-slate-700 px-3 py-1 text-[11px] text-slate-200 hover:bg-slate-800"
+                      >
+                        {deal.internalNote ? "Редактировать заметку" : "Добавить заметку"}
+                      </button>
                     </div>
                   )}
                 </div>
